@@ -1,0 +1,5 @@
+02
+
+# Compile
+clang++ -O3 -c $(llvm-config --cxxflags) toy.cpp -o toy.o
+clang++ toy.o $(llvm-config --ldflags --libs) -lpthread -lncurses
