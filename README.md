@@ -1,6 +1,6 @@
 
 ## At a glance ##
-A step-by-step tutorial for building an out-of-source LLVM pass based on Adrian Sampson's "LLVM for Grad Students"
+A step-by-step tutorial for building an out-of-source LLVM pass based on Adrian Sampson's "LLVM for Grad Students". Adapted for LLVM 9 and plan to use for MLIR study.
 
 ## Setup ##
 
@@ -9,8 +9,7 @@ and code transformation tools. We consider in this tutorial:
 - Building LLVM from source
 - Building a trivial out-of-source LLVM pass.
 
-We will be building LLVM v`7.0.0` which is the latest as of this writing.
-We assume that you have a working compiler toolchain (GCC or LLVM) and that CMake is installed (minimum version 3.4).
+We will be building LLVM v`9.0.0`. We assume that you have a working compiler toolchain (GCC or LLVM) and that CMake is installed (minimum version 3.4).
 
 
 ## Compiling LLVM ##
@@ -66,9 +65,10 @@ $ cmake ..
 $ make
 ```
 `cmake` needs to find its LLVM configurations in `[LLVM_DIR]`. We automatically
-setup `[LLVM_DIR]` based on `$LLVM_HOME` for you. Now the easiest way to run the skeleton pass is to use Clang:
+setup `[LLVM_DIR]` based on `$LLVM_HOME` for you. `$LLVM_HOME` is something liek "/usr/local/lib/cmake/llvm/" in your system.
+Now the easiest way to run the skeleton pass is to use Clang:
 ```bash
-$ clang-7.0 -Xclang -load -Xclang build/skeleton/libSkeletonPass.* something.c$
+$ clang -Xclang -load -Xclang build/skeleton/libSkeletonPass.* something.c$
 ```
 Note that Clang is the compiler front-end of the LLVM project.
 It can be installed separately in binary form.
