@@ -3,3 +3,4 @@ build
 *.out
 _build
 .vscode
+kaleidoscope/toy
