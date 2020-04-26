@@ -1,4 +1,4 @@
-#include "./KaleidoscopeJIT.h"
+#include "KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -17,7 +17,9 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include <algorithm>
+#include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -26,9 +28,6 @@
 #include <vector>
 
 using namespace llvm;
-
- // On Requst Compilation, a modular MCJIT
- // https://llvm.org/devmtg/2016-11/Slides/Hames-ORC.pdf
 using namespace llvm::orc;
 
 //===----------------------------------------------------------------------===//
@@ -410,7 +409,6 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
 // Code Generation
 //===----------------------------------------------------------------------===//
 
-// TheContext is an opaque object that owns a lot of core LLVM data structures.
 static LLVMContext TheContext;
 static IRBuilder<> Builder(TheContext);
 static std::unique_ptr<Module> TheModule;
@@ -419,23 +417,24 @@ static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
 static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
-
 Value *LogErrorV(const char *Str) {
   LogError(Str);
   return nullptr;
 }
 
 Function *getFunction(std::string Name) {
-    if (auto *F = TheModule->getFunction(Name)) {
-        return F;
-    }
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule->getFunction(Name))
+    return F;
 
-    auto FI = FunctionProtos.find(Name);
-    if (FI != FunctionProtos.end()) {
-        return FI->second->codegen();
-    }
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI->second->codegen();
 
-    return nullptr;
+  // If no existing prototype exists, return null.
+  return nullptr;
 }
 
 Value *NumberExprAST::codegen() {
@@ -474,7 +473,7 @@ Value *BinaryExprAST::codegen() {
 
 Value *CallExprAST::codegen() {
   // Look up the name in the global module table.
-  Function *CalleeF = TheModule->getFunction(Callee);
+  Function *CalleeF = getFunction(Callee);
   if (!CalleeF)
     return LogErrorV("Unknown function referenced");
 
@@ -510,12 +509,11 @@ Function *PrototypeAST::codegen() {
 }
 
 Function *FunctionAST::codegen() {
-  // First, check for an existing function from a previous 'extern' declaration.
-  Function *TheFunction = TheModule->getFunction(Proto->getName());
-
-  if (!TheFunction)
-    TheFunction = Proto->codegen();
-
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &P = *Proto;
+  FunctionProtos[Proto->getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
   if (!TheFunction)
     return nullptr;
 
@@ -535,6 +533,9 @@ Function *FunctionAST::codegen() {
     // Validate the generated code, checking for consistency.
     verifyFunction(*TheFunction);
 
+    // Run the optimizer on the function.
+    TheFPM->run(*TheFunction);
+
     return TheFunction;
   }
 
@@ -547,17 +548,24 @@ Function *FunctionAST::codegen() {
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
 
-static void InitializeModulAndPassManager() {
-    TheModule = llvm::make_unique<Module>("my_jit", TheContext);
-    TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+static void InitializeModuleAndPassManager() {
+  // Open a new module.
+  TheModule = llvm::make_unique<Module>("my cool jit", TheContext);
+  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 
-    TheFPM = llvm::make_unique<legacy::FunctionPassManager>(TheModule.get());
+  // Create a new pass manager attached to it.
+  TheFPM = llvm::make_unique<legacy::FunctionPassManager>(TheModule.get());
 
-    TheFPM->add(createInstructionCombiningPass());
-    TheFPM->add(createReassociatePass());
-    TheFPM->add(createGVNPass());
-    TheFPM->add(createCFGSimplificationPass());
-    TheFPM->doInitialization();
+  // Do simple "peephole" optimizations and bit-twiddling optzns.
+  TheFPM->add(createInstructionCombiningPass());
+  // Reassociate expressions.
+  TheFPM->add(createReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM->add(createGVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM->add(createCFGSimplificationPass());
+
+  TheFPM->doInitialization();
 }
 
 static void HandleDefinition() {
@@ -567,7 +575,7 @@ static void HandleDefinition() {
       FnIR->print(errs());
       fprintf(stderr, "\n");
       TheJIT->addModule(std::move(TheModule));
-      InitializeModulAndPassManager();
+      InitializeModuleAndPassManager();
     }
   } else {
     // Skip token for error recovery.
@@ -592,16 +600,24 @@ static void HandleExtern() {
 static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
-      if (FnAST->codegen()) {
-          auto H = TheJIT->addModule(std::move(TheModule));
-          InitializeModulAndPassManager();
-          auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
-          assert(ExprSymbol && "Function not found");
+    if (FnAST->codegen()) {
+      // JIT the module containing the anonymous expression, keeping a handle so
+      // we can free it later.
+      auto H = TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
 
-          double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
-          fprintf(stderr, "Evaluated to %f\n", FP());
-          TheJIT->removeModule(H);
-      }
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+      assert(ExprSymbol && "Function not found");
+
+      // Get the symbol's address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete the anonymous expression module from the JIT.
+      TheJIT->removeModule(H);
+    }
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -631,7 +647,6 @@ static void MainLoop() {
   }
 }
 
-
 //===----------------------------------------------------------------------===//
 // "Library" functions that can be "extern'd" from user code.
 //===----------------------------------------------------------------------===//
@@ -659,9 +674,10 @@ extern "C" DLLEXPORT double printd(double X) {
 //===----------------------------------------------------------------------===//
 
 int main() {
-    InitializeNativeTarget();
-    InitializeNativeTargetAsmPrinter();
-    InitializeNativeTargetAsmParser();
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['<'] = 10;
@@ -674,7 +690,8 @@ int main() {
   getNextToken();
 
   TheJIT = llvm::make_unique<KaleidoscopeJIT>();
-  InitializeModulAndPassManager();
+
+  InitializeModuleAndPassManager();
 
   // Run the main "interpreter loop" now.
   MainLoop();
