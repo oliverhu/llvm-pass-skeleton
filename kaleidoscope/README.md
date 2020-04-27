@@ -23,3 +23,4 @@ History of JIT: http://eecs.ucf.edu/~dcm/Teaching/COT4810-Spring2011/Literature/
 clang++ -g toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core mcjit native orcjit` -rdynamic -O3 -o toy
 
 05 Control Flow
+06 User-defined operators
