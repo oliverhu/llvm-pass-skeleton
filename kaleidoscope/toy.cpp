@@ -27,7 +27,9 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
+#include <string>
 
 using namespace llvm;
 using namespace llvm::orc;
@@ -163,19 +165,18 @@ public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
 
   Value *codegen() override;
-  const std::string &getName() const { return Name; }
+    const std::string &getName() const { return Name; }
 
 };
 
-/// VarExprAST - Expression class for var/in
-class VarExprAST : public ExprAST {
-  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
-  std::unique_ptr<ExprAST> Body;
+/// UnaryExprAST - Expression class for a unary operator.
+class UnaryExprAST : public ExprAST {
+  char Opcode;
+  std::unique_ptr<ExprAST> Operand;
 
 public:
-  VarExprAST(std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
-             std::unique_ptr<ExprAST> Body)
-    : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
+  UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
+    : Opcode(Opcode), Operand(std::move(Operand)) {}
 
   Value *codegen() override;
 };
@@ -233,14 +234,16 @@ public:
   Value *codegen() override;
 };
 
-/// UnaryExprAST - Expression class for a unary operator.
-class UnaryExprAST : public ExprAST {
-  char Opcode;
-  std::unique_ptr<ExprAST> Operand;
+
+/// VarExprAST - Expression class for var/in
+class VarExprAST : public ExprAST {
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+  std::unique_ptr<ExprAST> Body;
 
 public:
-  UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
-    : Opcode(Opcode), Operand(std::move(Operand)) {}
+  VarExprAST(std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
+             std::unique_ptr<ExprAST> Body)
+    : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
 
   Value *codegen() override;
 };
@@ -656,7 +659,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
   if (Kind && ArgNames.size() != Kind)
     return LogErrorP("Invalid number of operands for operator");
 
-  return llvm::make_unique<PrototypeAST>(FnName, std::move(ArgNames),
+  return llvm::make_unique<PrototypeAST>(FnName, ArgNames,
                                          Kind != 0, BinaryPrecedence);
 }
 
@@ -701,12 +704,6 @@ static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
 static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
-static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction, const std::string &VarName) {
-  IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
-                  TheFunction->getEntryBlock().begin());
-  return TmpB.CreateAlloca(Type::getDoublePtrTy(TheContext), 0, VarName.c_str());
-}
-
 Value *LogErrorV(const char *Str) {
   LogError(Str);
   return nullptr;
@@ -727,6 +724,16 @@ Function *getFunction(std::string Name) {
   return nullptr;
 }
 
+/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
+/// the function.  This is used for mutable variables etc.
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
+                                          const std::string &VarName) {
+  IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
+                   TheFunction->getEntryBlock().begin());
+  return TmpB.CreateAlloca(Type::getDoubleTy(TheContext), nullptr, VarName);
+}
+
+
 Value *NumberExprAST::codegen() {
   return ConstantFP::get(TheContext, APFloat(Val));
 }
@@ -741,14 +748,12 @@ Value *VariableExprAST::codegen() {
 
 Value *VarExprAST::codegen() {
   std::vector<AllocaInst *> OldBindings;
-
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
-
   // Register all variables and emit their initializer.
   for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
     const std::string &VarName = VarNames[i].first;
     ExprAST *Init = VarNames[i].second.get();
-      // Emit the initializer before adding the variable to scope, this prevents
+    // Emit the initializer before adding the variable to scope, this prevents
     // the initializer from referencing the variable itself, and permits stuff
     // like this:
     //  var a = 1 in
@@ -761,14 +766,11 @@ Value *VarExprAST::codegen() {
     } else { // If not specified, use 0.0.
       InitVal = ConstantFP::get(TheContext, APFloat(0.0));
     }
-
     AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
     Builder.CreateStore(InitVal, Alloca);
-
     // Remember the old variable binding so that we can restore the binding when
     // we unrecurse.
     OldBindings.push_back(NamedValues[VarName]);
-
     // Remember this binding.
     NamedValues[VarName] = Alloca;
   }
@@ -779,11 +781,21 @@ Value *VarExprAST::codegen() {
   // Pop all our variables from scope.
   for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
     NamedValues[VarNames[i].first] = OldBindings[i];
-
   // Return the body computation.
   return BodyVal;
 }
 
+Value *UnaryExprAST::codegen() {
+  Value *OperandV = Operand->codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string("unary") + Opcode);
+  if (!F)
+    return LogErrorV("Unknown unary operator");
+
+  return Builder.CreateCall(F, OperandV, "unop");
+}
 
 Value *BinaryExprAST::codegen() {
   // Special case '=' because we don't want to emit the LHS as an expression.
@@ -923,16 +935,15 @@ Value *IfExprAST::codegen() {
 //   br endcond, loop, endloop
 // outloop:
 Value *ForExprAST::codegen() {
-  // Emit the start code first, without 'variable' in scope.
-  Value *StartVal = Start->codegen();
-  if (!StartVal)
-    return nullptr;
-
   // Make the new basic block for the loop header, inserting after current
   // block.
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
   AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+  // Emit the start code first, without 'variable' in scope.
+  Value *StartVal = Start->codegen();
+  if (!StartVal)
+    return nullptr;
 
   Builder.CreateStore(StartVal, Alloca);
   BasicBlock *LoopBB = BasicBlock::Create(TheContext, "loop", TheFunction);
@@ -964,18 +975,14 @@ Value *ForExprAST::codegen() {
     // If not specified, use 1.0.
     StepVal = ConstantFP::get(TheContext, APFloat(1.0));
   }
-  
-  Value *CurVar = Builder.CreateLoad(Alloca, VarName.c_str());
-
-  Value *NextVar = Builder.CreateFAdd(CurVar, StepVal, "nextvar");
 
   // Compute the end condition.
   Value *EndCond = End->codegen();
   if (!EndCond)
     return nullptr;
   
-  Value *CurVal = Builder.CreateLoad(Alloca);
-  Value *NextVal = Builder.CreateFAdd(CurVal, StepVal, "nextvar");
+  Value *CurVar = Builder.CreateLoad(Alloca, VarName.c_str());
+  Value *NextVar = Builder.CreateFAdd(CurVar, StepVal, "nextvar");
   Builder.CreateStore(NextVar, Alloca);
 
   // Convert condition to a bool by comparing non-equal to 0.0.
@@ -1039,12 +1046,16 @@ Function *FunctionAST::codegen() {
   // Record the function arguments in the NamedValues map.
   NamedValues.clear();
   for (auto &Arg : TheFunction->args()) {
+    // Create an alloca for this variable.
     AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, Arg.getName());
-    
+    fprintf(stderr, "type: %d\n", Arg.getType()->getTypeID());
+
+    // Store the initial value into the alloca.
     Builder.CreateStore(&Arg, Alloca);
+
+    // Add arguments to variable symbol table.
     NamedValues[Arg.getName()] = Alloca;
   }
-    
 
   if (Value *RetVal = Body->codegen()) {
     // Finish off the function.
@@ -1061,21 +1072,11 @@ Function *FunctionAST::codegen() {
 
   // Error reading body, remove function.
   TheFunction->eraseFromParent();
+
+  if (P.isBinaryOp())
+    BinopPrecedence.erase(P.getOperatorName());
   return nullptr;
 }
-
-Value *UnaryExprAST::codegen() {
-  Value *OperandV = Operand->codegen();
-  if (!OperandV)
-    return nullptr;
-
-  Function *F = getFunction(std::string("unary") + Opcode);
-  if (!F)
-    return LogErrorV("Unknown unary operator");
-
-  return Builder.CreateCall(F, OperandV, "unop");
-}
-
 
 //===----------------------------------------------------------------------===//
 // Top-Level parsing and JIT Driver

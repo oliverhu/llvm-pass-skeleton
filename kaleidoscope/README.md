@@ -26,3 +26,6 @@ clang++ -g toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core m
 06 User-defined operators
 07 Mutable variables
 llvm-as < example.ll | opt -mem2reg | llvm-dis
+
+How to get core dump and investigate stack trace?
+- use valgrind: valgrind -v ./toy
