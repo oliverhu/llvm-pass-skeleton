@@ -703,6 +703,12 @@ static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
 static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction, const std::string &VarName) {
+  IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
+                  TheFunction->getEntryBlock().begin());
+  return TmpB.CreateAlloca(Type::getDoubleTy(TheContext), nullptr, VarName);
+}
+
 Value *LogErrorV(const char *Str) {
   LogError(Str);
   return nullptr;
@@ -722,16 +728,6 @@ Function *getFunction(std::string Name) {
   // If no existing prototype exists, return null.
   return nullptr;
 }
-
-/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
-/// the function.  This is used for mutable variables etc.
-static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
-                                          const std::string &VarName) {
-  IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
-                   TheFunction->getEntryBlock().begin());
-  return TmpB.CreateAlloca(Type::getDoubleTy(TheContext), nullptr, VarName);
-}
-
 
 Value *NumberExprAST::codegen() {
   return ConstantFP::get(TheContext, APFloat(Val));
@@ -784,17 +780,6 @@ Value *VarExprAST::codegen() {
   return BodyVal;
 }
 
-Value *UnaryExprAST::codegen() {
-  Value *OperandV = Operand->codegen();
-  if (!OperandV)
-    return nullptr;
-
-  Function *F = getFunction(std::string("unary") + Opcode);
-  if (!F)
-    return LogErrorV("Unknown unary operator");
-
-  return Builder.CreateCall(F, OperandV, "unop");
-}
 
 Value *BinaryExprAST::codegen() {
   // Special case '=' because we don't want to emit the LHS as an expression.
@@ -1076,6 +1061,19 @@ Function *FunctionAST::codegen() {
     BinopPrecedence.erase(P.getOperatorName());
   return nullptr;
 }
+
+Value *UnaryExprAST::codegen() {
+  Value *OperandV = Operand->codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string("unary") + Opcode);
+  if (!F)
+    return LogErrorV("Unknown unary operator");
+
+  return Builder.CreateCall(F, OperandV, "unop");
+}
+
 
 //===----------------------------------------------------------------------===//
 // Top-Level parsing and JIT Driver
