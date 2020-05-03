@@ -29,3 +29,5 @@ llvm-as < example.ll | opt -mem2reg | llvm-dis
 
 How to get core dump and investigate stack trace?
 - use valgrind: valgrind -v ./toy
+
+08 Compiling to Object Code

@@ -12,12 +12,17 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
-#include "llvm/Target/TargetMachine.h"
+#include "llvm/Support/raw_os_ostream.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Utils.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -30,9 +35,11 @@
 #include <utility>
 #include <vector>
 #include <string>
+#include <system_error>
 
 using namespace llvm;
 using namespace llvm::orc;
+using namespace llvm::sys;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -699,15 +706,9 @@ static LLVMContext TheContext;
 static IRBuilder<> Builder(TheContext);
 static std::unique_ptr<Module> TheModule;
 static std::map<std::string, AllocaInst *> NamedValues;
-static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
-static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+// static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
+// static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
-
-static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction, const std::string &VarName) {
-  IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
-                  TheFunction->getEntryBlock().begin());
-  return TmpB.CreateAlloca(Type::getDoubleTy(TheContext), nullptr, VarName);
-}
 
 Value *LogErrorV(const char *Str) {
   LogError(Str);
@@ -729,6 +730,24 @@ Function *getFunction(std::string Name) {
   return nullptr;
 }
 
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction, const std::string &VarName) {
+  IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
+                  TheFunction->getEntryBlock().begin());
+  return TmpB.CreateAlloca(Type::getDoubleTy(TheContext), nullptr, VarName);
+}
+
+Value *UnaryExprAST::codegen() {
+  Value *OperandV = Operand->codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string("unary") + Opcode);
+  if (!F)
+    return LogErrorV("Unknown unary operator");
+
+  return Builder.CreateCall(F, OperandV, "unop");
+}
+
 Value *NumberExprAST::codegen() {
   return ConstantFP::get(TheContext, APFloat(Val));
 }
@@ -740,46 +759,6 @@ Value *VariableExprAST::codegen() {
     return LogErrorV("Unknown variable name");
   return Builder.CreateLoad(V, Name.c_str());
 }
-
-Value *VarExprAST::codegen() {
-  std::vector<AllocaInst *> OldBindings;
-  Function *TheFunction = Builder.GetInsertBlock()->getParent();
-  // Register all variables and emit their initializer.
-  for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
-    const std::string &VarName = VarNames[i].first;
-    ExprAST *Init = VarNames[i].second.get();
-    // Emit the initializer before adding the variable to scope, this prevents
-    // the initializer from referencing the variable itself, and permits stuff
-    // like this:
-    //  var a = 1 in
-    //    var a = a in ...   # refers to outer 'a'.
-    Value *InitVal;
-    if (Init) {
-      InitVal = Init->codegen();
-      if (!InitVal)
-        return nullptr;
-    } else { // If not specified, use 0.0.
-      InitVal = ConstantFP::get(TheContext, APFloat(0.0));
-    }
-    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
-    Builder.CreateStore(InitVal, Alloca);
-    // Remember the old variable binding so that we can restore the binding when
-    // we unrecurse.
-    OldBindings.push_back(NamedValues[VarName]);
-    // Remember this binding.
-    NamedValues[VarName] = Alloca;
-  }
-  // Codegen the body, now that all vars are in scope.
-  Value *BodyVal = Body->codegen();
-  if (!BodyVal)
-    return nullptr;
-  // Pop all our variables from scope.
-  for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
-    NamedValues[VarNames[i].first] = OldBindings[i];
-  // Return the body computation.
-  return BodyVal;
-}
-
 
 Value *BinaryExprAST::codegen() {
   // Special case '=' because we don't want to emit the LHS as an expression.
@@ -993,6 +972,46 @@ Value *ForExprAST::codegen() {
   return Constant::getNullValue(Type::getDoubleTy(TheContext));
 }
 
+
+Value *VarExprAST::codegen() {
+  std::vector<AllocaInst *> OldBindings;
+  Function *TheFunction = Builder.GetInsertBlock()->getParent();
+  // Register all variables and emit their initializer.
+  for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
+    const std::string &VarName = VarNames[i].first;
+    ExprAST *Init = VarNames[i].second.get();
+    // Emit the initializer before adding the variable to scope, this prevents
+    // the initializer from referencing the variable itself, and permits stuff
+    // like this:
+    //  var a = 1 in
+    //    var a = a in ...   # refers to outer 'a'.
+    Value *InitVal;
+    if (Init) {
+      InitVal = Init->codegen();
+      if (!InitVal)
+        return nullptr;
+    } else { // If not specified, use 0.0.
+      InitVal = ConstantFP::get(TheContext, APFloat(0.0));
+    }
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+    Builder.CreateStore(InitVal, Alloca);
+    // Remember the old variable binding so that we can restore the binding when
+    // we unrecurse.
+    OldBindings.push_back(NamedValues[VarName]);
+    // Remember this binding.
+    NamedValues[VarName] = Alloca;
+  }
+  // Codegen the body, now that all vars are in scope.
+  Value *BodyVal = Body->codegen();
+  if (!BodyVal)
+    return nullptr;
+  // Pop all our variables from scope.
+  for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+    NamedValues[VarNames[i].first] = OldBindings[i];
+  // Return the body computation.
+  return BodyVal;
+}
+
 Function *PrototypeAST::codegen() {
   // Make the function type:  double(double,double) etc.
   std::vector<Type *> Doubles(Args.size(), Type::getDoubleTy(TheContext));
@@ -1049,7 +1068,7 @@ Function *FunctionAST::codegen() {
     verifyFunction(*TheFunction);
 
     // Run the optimizer on the function.
-    TheFPM->run(*TheFunction);
+    // TheFPM->run(*TheFunction);
 
     return TheFunction;
   }
@@ -1062,19 +1081,6 @@ Function *FunctionAST::codegen() {
   return nullptr;
 }
 
-Value *UnaryExprAST::codegen() {
-  Value *OperandV = Operand->codegen();
-  if (!OperandV)
-    return nullptr;
-
-  Function *F = getFunction(std::string("unary") + Opcode);
-  if (!F)
-    return LogErrorV("Unknown unary operator");
-
-  return Builder.CreateCall(F, OperandV, "unop");
-}
-
-
 //===----------------------------------------------------------------------===//
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
@@ -1082,24 +1088,24 @@ Value *UnaryExprAST::codegen() {
 static void InitializeModuleAndPassManager() {
   // Open a new module.
   TheModule = llvm::make_unique<Module>("my cool jit", TheContext);
-  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+  // TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 
   // Create a new pass manager attached to it.
-  TheFPM = llvm::make_unique<legacy::FunctionPassManager>(TheModule.get());
+  // TheFPM = llvm::make_unique<legacy::FunctionPassManager>(TheModule.get());
 
-  // Promote allocas to registers.
-  TheFPM->add(createPromoteMemoryToRegisterPass());
+  // // Promote allocas to registers.
+  // TheFPM->add(createPromoteMemoryToRegisterPass());
 
-  // Do simple "peephole" optimizations and bit-twiddling optzns.
-  TheFPM->add(createInstructionCombiningPass());
-  // Reassociate expressions.
-  TheFPM->add(createReassociatePass());
-  // Eliminate Common SubExpressions.
-  TheFPM->add(createGVNPass());
-  // Simplify the control flow graph (deleting unreachable blocks, etc).
-  TheFPM->add(createCFGSimplificationPass());
+  // // Do simple "peephole" optimizations and bit-twiddling optzns.
+  // TheFPM->add(createInstructionCombiningPass());
+  // // Reassociate expressions.
+  // TheFPM->add(createReassociatePass());
+  // // Eliminate Common SubExpressions.
+  // TheFPM->add(createGVNPass());
+  // // Simplify the control flow graph (deleting unreachable blocks, etc).
+  // TheFPM->add(createCFGSimplificationPass());
 
-  TheFPM->doInitialization();
+  // TheFPM->doInitialization();
 }
 
 static void HandleDefinition() {
@@ -1108,8 +1114,8 @@ static void HandleDefinition() {
       fprintf(stderr, "Read function definition:");
       FnIR->print(errs());
       fprintf(stderr, "\n");
-      TheJIT->addModule(std::move(TheModule));
-      InitializeModuleAndPassManager();
+      // TheJIT->addModule(std::move(TheModule));
+      // InitializeModuleAndPassManager(); // MUST COMMENT OUT THIS LINE TO HAVE LEGIT OUTPUT.
     }
   } else {
     // Skip token for error recovery.
@@ -1135,22 +1141,22 @@ static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
     if (FnAST->codegen()) {
-      // JIT the module containing the anonymous expression, keeping a handle so
-      // we can free it later.
-      auto H = TheJIT->addModule(std::move(TheModule));
-      InitializeModuleAndPassManager();
+      // // JIT the module containing the anonymous expression, keeping a handle so
+      // // we can free it later.
+      // auto H = TheJIT->addModule(std::move(TheModule));
+      // InitializeModuleAndPassManager();
 
-      // Search the JIT for the __anon_expr symbol.
-      auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
-      assert(ExprSymbol && "Function not found");
+      // // Search the JIT for the __anon_expr symbol.
+      // auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+      // assert(ExprSymbol && "Function not found");
 
-      // Get the symbol's address and cast it to the right type (takes no
-      // arguments, returns a double) so we can call it as a native function.
-      double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
-      fprintf(stderr, "Evaluated to %f\n", FP());
+      // // Get the symbol's address and cast it to the right type (takes no
+      // // arguments, returns a double) so we can call it as a native function.
+      // double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+      // fprintf(stderr, "Evaluated to %f\n", FP());
 
-      // Delete the anonymous expression module from the JIT.
-      TheJIT->removeModule(H);
+      // // Delete the anonymous expression module from the JIT.
+      // TheJIT->removeModule(H);
     }
   } else {
     // Skip token for error recovery.
@@ -1208,9 +1214,9 @@ extern "C" DLLEXPORT double printd(double X) {
 //===----------------------------------------------------------------------===//
 
 int main() {
-  InitializeNativeTarget();
-  InitializeNativeTargetAsmPrinter();
-  InitializeNativeTargetAsmParser();
+  // InitializeNativeTarget();
+  // InitializeNativeTargetAsmPrinter();
+  // InitializeNativeTargetAsmParser();
 
   // Install standard binary operators.
   // 1 is lowest precedence.
@@ -1224,12 +1230,64 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
-  TheJIT = llvm::make_unique<KaleidoscopeJIT>();
+  // TheJIT = llvm::make_unique<KaleidoscopeJIT>();
 
   InitializeModuleAndPassManager();
 
   // Run the main "interpreter loop" now.
   MainLoop();
+  InitializeAllTargetInfos();
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
+  InitializeAllAsmParsers();
+  InitializeAllAsmPrinters();
+
+
+  auto TargetTriple = sys::getDefaultTargetTriple();
+  TheModule->setTargetTriple(TargetTriple);
+
+  std::string Error;
+  auto Target = TargetRegistry::lookupTarget(TargetTriple, Error);
+
+  // Print an error and exit if we couldn't find the requested target.
+  // This generally occurs if we've forgotten to initialise the
+  // TargetRegistry or we have a bogus target triple.
+  if (!Target) {
+    errs() << Error;
+    return 1;
+  }
+
+  auto CPU = "generic";
+  auto Features = "";
+
+  TargetOptions opt;
+  auto RM = Optional<Reloc::Model>();
+  auto TheTargetMachine =
+      Target->createTargetMachine(TargetTriple, CPU, Features, opt, RM);
+
+  TheModule->setDataLayout(TheTargetMachine->createDataLayout());
+
+  auto Filename = "output.o";
+  std::error_code EC;
+  raw_fd_ostream dest(Filename, EC, sys::fs::F_None);
+
+  if (EC) {
+    errs() << "Could not open file: " << EC.message();
+    return 1;
+  }
+
+  legacy::PassManager pass;
+  auto FileType = TargetMachine::CGFT_ObjectFile;
+
+  if (TheTargetMachine->addPassesToEmitFile(pass, dest, nullptr, FileType)) {
+    errs() << "TheTargetMachine can't emit a file of this type";
+    return 1;
+  }
+
+  pass.run(*TheModule);
+  dest.flush();
+
+  outs() << "Wrote " << Filename << "\n";
 
   return 0;
 }
